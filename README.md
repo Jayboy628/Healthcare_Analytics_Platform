@@ -10,6 +10,7 @@ A cloud-native healthcare staffing analytics platform built on AWS and the Datab
 
 ```
 
+
 Hospital Sources (SFTP / API / ADT / Webhooks)
                     │
                     ▼
