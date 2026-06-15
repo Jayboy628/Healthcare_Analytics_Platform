@@ -6,10 +6,20 @@ A cloud-native healthcare staffing analytics platform built on AWS and the Datab
 
 ---
 
+## Healthcare Solution Architect
+
+```
+
+![App Screenshot](images/HealthcareAnalyticsPlatform.png)
+
+```
+---
+
 ## Architecture Overview
 
 ```
 
+![App Screenshot](images/screenshot.png)
 
 Hospital Sources (SFTP / API / ADT / Webhooks)
                     │
