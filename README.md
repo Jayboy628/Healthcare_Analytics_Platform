@@ -14,90 +14,32 @@ A cloud-native healthcare staffing analytics platform built on AWS and the Datab
 *Figure 1: End-to-end Healthcare Staffing Analytics Platform architecture on AWS and Databricks.*
 
 
-
-
 ---
 
 ## Architecture Overview
 
 
 <p align="center">
-  <img src="images/data_pipeline_architecture.png" width="1000">
+  <img src="images/data_pipeline_architecture.png" width="90%">
+</p>
+
+<p align="center">
+  <em>Figure 1: End-to-end Healthcare Staffing Analytics Platform on AWS and Databricks.</em>
 </p>
 
 
-```
 
+## Operational Metadata Layer
 
-Hospital Sources (SFTP / API / ADT / Webhooks)
-                    │
-                    ▼
-               S3 Landing
-                    │
-                    ▼
-             SQS File Queue
-                    │
-                    ▼
-           AWS Glue Crawler
-                    │
-                    ▼
-             Glue Catalog
-                    │
-                    ▼
-      Databricks Auto Loader
-                    │
-                    ▼
-         Bronze Delta Tables
-                    │
-                    ▼
-         Silver Delta Tables
-                    │
-                    ▼
-          Gold Delta Tables
-                    │
-      ┌─────────────┼─────────────┐
-      ▼             ▼             ▼
- ML-Ready      Databricks SQL   Redis Cache
- Feature Layer    Dashboards
-      │ ▲
-      ▼ │
-AI Staffing Models
-      │
-Dashboard Cache Layer
-      │
-      ▼
-Streamlit / Power BI / Executive Reporting
-
-Real-Time Path
-───────────────────────────────────────────
-
-ADT Events
-     │
-     ▼
-Kinesis Data Streams
-     │
-     ▼
-Lambda Validation
-     │
-     ▼
-Databricks Structured Streaming
-     │
-     ▼
-Delta Bronze Tables
-
-State / Logs
-
-Operational Metadata Layer
-─────────────────────────────────────
-
+```text
 DynamoDB
 │
-├── hc_pipeline_log
-├── hc_file_ledger
-├── hc_metadata_store
-├── hc_dq_log
-├── hc_job_checkpoint
-└── hc_cache_manifest
+├── hc_pipeline_log      → Pipeline execution history
+├── hc_file_ledger       → Processed file tracking
+├── hc_metadata_store    → Schema and configuration metadata
+├── hc_dq_log            → Data quality violations
+├── hc_job_checkpoint    → Incremental processing state
+└── hc_cache_manifest    → Cache and manifest tracking
 ```
 
 ## S3 Data Lake Architecture
