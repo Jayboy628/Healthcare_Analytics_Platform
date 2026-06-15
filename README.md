@@ -3,12 +3,7 @@
 
 A cloud-native healthcare staffing analytics platform built on AWS and the Databricks Lakehouse. The platform centralizes operational staffing data from multi-facility hospital networks, supporting batch and real-time ingestion, automated data-quality governance, predictive workforce analytics, and executive reporting — all within a governed Medallion architecture on Delta Lake.
 
-
 ---
-
-## Healthcare Solution Architect
-
-```
 
 ## Healthcare Solution Architect
 
@@ -18,7 +13,7 @@ A cloud-native healthcare staffing analytics platform built on AWS and the Datab
 
 *Figure 1: End-to-end Healthcare Staffing Analytics Platform architecture on AWS and Databricks.*
 
-```
+
 
 
 ---
