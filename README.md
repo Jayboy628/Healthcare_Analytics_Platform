@@ -20,6 +20,12 @@ A cloud-native healthcare staffing analytics platform built on AWS and the Datab
 
 ## Architecture Overview
 
+
+<p align="center">
+  <img src="images/data_pipeline_architecture.png" width="1000">
+</p>
+
+
 ```
 
 
