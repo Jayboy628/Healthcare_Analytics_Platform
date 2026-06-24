@@ -11,22 +11,23 @@ A cloud-native healthcare staffing analytics platform that centralises operation
 1. [Architecture Overview](#architecture-overview)
 2. [Data Flow](#data-flow)
 3. [Infrastructure — AWS Services](#infrastructure--aws-services)
-4. [Data Pipeline — Batch Path](#data-pipeline--batch-path)
-5. [Data Pipeline — Real-Time Path](#data-pipeline--real-time-path)
-6. [Lambda File Validator & DQ](#lambda-file-validator--dq)
-7. [Quarantine Process](#quarantine-process)
-8. [DynamoDB Operational Tables](#dynamodb-operational-tables)
-9. [AWS Glue — Schema Catalog](#aws-glue--schema-catalog)
-10. [Databricks Workflows](#databricks-workflows)
-11. [SNS Alerts & CloudWatch Monitoring](#sns-alerts--cloudwatch-monitoring)
-12. [Redis Caching Layer](#redis-caching-layer)
-13. [Streamlit Dashboard](#streamlit-dashboard)
-14. [Databricks Medallion Architecture](#databricks-medallion-architecture)
-15. [Unity Catalog Hierarchy](#unity-catalog-hierarchy)
-16. [Repository Structure](#repository-structure)
-17. [Quick Start — Running the Pipeline](#quick-start--running-the-pipeline)
-18. [Deployment](#deployment)
-19. [Why Databricks](#why-databricks)
+4. [Network Architecture — VPC & Security](#network-architecture--vpc--security)
+5. [Data Pipeline — Batch Path](#data-pipeline--batch-path)
+6. [Data Pipeline — Real-Time Path](#data-pipeline--real-time-path)
+7. [Lambda File Validator & DQ](#lambda-file-validator--dq)
+8. [Quarantine Process](#quarantine-process)
+9. [DynamoDB Operational Tables](#dynamodb-operational-tables)
+10. [AWS Glue — Schema Catalog](#aws-glue--schema-catalog)
+11. [Databricks Workflows](#databricks-workflows)
+12. [SNS Alerts & CloudWatch Monitoring](#sns-alerts--cloudwatch-monitoring)
+13. [Redis Caching Layer](#redis-caching-layer)
+14. [Streamlit Dashboard](#streamlit-dashboard)
+15. [Databricks Medallion Architecture](#databricks-medallion-architecture)
+16. [Unity Catalog Hierarchy](#unity-catalog-hierarchy)
+17. [Repository Structure](#repository-structure)
+18. [Quick Start — Running the Pipeline](#quick-start--running-the-pipeline)
+19. [Deployment](#deployment)
+20. [Why Databricks](#why-databricks)
 
 ---
 
@@ -130,6 +131,105 @@ s3://hc-data-lake-prod/
 | Gold | 7 years |
 | Audit | 7 years |
 | Quarantine | 180 days |
+
+
+---
+
+## Network Architecture — VPC & Security
+
+The platform runs inside a dedicated VPC with strict network isolation. All compute resources (Lambda, Glue, Redis) are in private subnets — no direct internet access. HIPAA requires this boundary to ensure PHI never traverses the public internet.
+
+### VPC Layout
+
+```
+VPC: healthcare-data-platform-vpc-prod
+CIDR: 10.0.0.0/16  |  vpc-0de5705591edb6087  |  us-east-1
+│
+├── PUBLIC SUBNETS (NAT Gateways only — no compute)
+│   ├── 10.0.101.0/24  us-east-1a  →  NAT GW 0  (3.228.32.206)
+│   ├── 10.0.102.0/24  us-east-1b  →  NAT GW 1  (44.207.227.88)
+│   └── 10.0.103.0/24  us-east-1c  →  NAT GW 2  (54.205.60.209)
+│
+├── PRIVATE SUBNETS (all compute lives here)
+│   ├── 10.0.1.0/24  us-east-1a  →  Lambda · Glue · Redis Primary
+│   ├── 10.0.2.0/24  us-east-1b  →  Lambda · Glue · Redis Replica
+│   └── 10.0.3.0/24  us-east-1c  →  Lambda · Glue · Redis Replica
+│
+└── INTERNET GATEWAY: igw-0627d9f33aa87bc94
+```
+
+### Traffic Flow
+
+```
+Private Subnet Resource (Lambda / Glue)
+        │  needs to call AWS API (S3, DynamoDB, KMS, Kinesis)
+        ▼
+Route Table (private) → 0.0.0.0/0 → NAT Gateway (same AZ)
+        │
+        ▼
+NAT Gateway (public subnet) → Internet Gateway → AWS Public Endpoint
+        │
+        ▼  response returns same path
+Lambda / Glue receives API response
+
+INBOUND: Nothing from internet can reach private subnet resources.
+         No inbound rules on Lambda. Redis only reachable from sg-lambda and sg-glue.
+```
+
+### Route Tables
+
+| Route Table | ID | Default Route | Used By |
+|---|---|---|---|
+| `public-rt-prod` | `rtb-08ea03678852e1b62` | `→ IGW` | Public subnets (NAT GWs) |
+| `private-rt-0-prod` | `rtb-004ca61990a4d7d49` | `→ NAT GW 0` | Private subnet us-east-1a |
+| `private-rt-1-prod` | `rtb-090275665545c6b17` | `→ NAT GW 1` | Private subnet us-east-1b |
+| `private-rt-2-prod` | `rtb-01eaed3b8c6cf77c8` | `→ NAT GW 2` | Private subnet us-east-1c |
+
+Each private subnet routes to the NAT Gateway **in its own AZ**. If us-east-1a fails, us-east-1b and us-east-1c continue processing independently.
+
+### Security Groups
+
+| Security Group | ID | Inbound | Outbound | Attached To |
+|---|---|---|---|---|
+| `sg-lambda-prod` | `sg-0b4aab636968a0fc5` | None (event-driven) | 443 → internet · 6379 → sg-redis | Lambda functions |
+| `sg-glue-prod` | `sg-0eca45369d1117cd8` | Self (worker coordination) | 443 → internet · Self | Glue crawler |
+| `sg-redis-prod` | `sg-0ff7876ceda9f69b6` | 6379 ← sg-lambda · 6379 ← sg-glue | None needed | ElastiCache Redis |
+
+**Zero-trust enforcement:** Redis (`sg-redis-prod`) only accepts connections from `sg-lambda-prod` and `sg-glue-prod`. No other VPC resource — not even another Lambda — can reach Redis without being in an allowed security group.
+
+### NAT Gateways — Why Three?
+
+| | One NAT Gateway | Three NAT Gateways ✅ |
+|---|---|---|
+| Cost | ~$33/month | ~$100/month |
+| AZ failure impact | **All private subnets lose internet** | Only that AZ affected |
+| HIPAA HA requirement | ❌ Single point of failure | ✅ AZ-independent |
+| Production suitable | ❌ | ✅ |
+
+Three NAT Gateways ensure an AZ-level outage never takes down the full pipeline. Lambda in us-east-1b routes through NAT GW 1 regardless of what happens in us-east-1a.
+
+### Cost Optimisation — VPC Gateway Endpoints (Recommended Addition)
+
+S3 and DynamoDB Gateway Endpoints are **free** and eliminate NAT Gateway data transfer charges for these two high-volume services:
+
+```hcl
+# Add to modules/network/main.tf
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.this.id
+  service_name      = "com.amazonaws.us-east-1.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [for rt in aws_route_table.private : rt.id]
+}
+
+resource "aws_vpc_endpoint" "dynamodb" {
+  vpc_id            = aws_vpc.this.id
+  service_name      = "com.amazonaws.us-east-1.dynamodb"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [for rt in aws_route_table.private : rt.id]
+}
+```
+
+Lambda reads S3 on every file and writes to DynamoDB on every record — both bypass NAT Gateway with endpoints, reducing monthly costs by $200–500 at production scale.
 
 ---
 
