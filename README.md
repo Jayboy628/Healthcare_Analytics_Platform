@@ -910,3 +910,14 @@ Databricks was selected because this platform must support near real-time staffi
 | Streamlit | Live operational dashboard |
 | CloudWatch | Metrics · alarms · log aggregation |
 | KMS | Customer-managed encryption for all services |
+
+---
+
+## Author
+
+**Shaunjay Brown**  
+Data Engineer | AI | Databricks | AWS - TERRAFORM
+
+Passionate about building cloud-native data platforms, real-time analytics solutions, and AI-driven healthcare applications.
+
+© 2026 Shaunjay Brown

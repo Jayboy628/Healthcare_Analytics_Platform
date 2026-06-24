@@ -1,0 +1,77 @@
+-- =============================================================================
+-- databricks_load/common/schemas/create_all_tables.sql
+--
+-- PURPOSE
+--   Creates all Unity Catalog schemas and Delta tables for the healthcare
+--   analytics platform. Run ONCE in the Databricks SQL Editor after Unity
+--   Catalog external locations have been confirmed (Pass 2 of Terraform deploy).
+--
+-- WHEN TO RUN
+--   After: terraform apply (both passes complete)
+--   Before: 00_init_batch_control.py (which seeds data into these tables)
+--   Before: any pipeline notebook run
+--
+-- HOW TO RUN
+--   Databricks workspace → SQL Editor → paste this file → Run All
+--   All statements are IF NOT EXISTS — safe to re-run without data loss.
+--
+-- SCHEMA OVERVIEW
+--   bronze        Raw data as received from hospitals (all STRING types)
+--   silver        Typed, deduplicated, DQ-flagged records
+--   gold          Business-ready fact and dimension tables
+--   ml_ready      Feature-engineered datasets for ML models
+--   batch_control Pipeline operational tables (file registry, run tracking)
+--
+-- TABLE NOTES
+--
+-- batch_control.file_registry
+--   Tracks every file from landing to Gold. One row per file_checksum.
+--   Partitioned by file_date for efficient date-range queries.
+--   CDF enabled: Change Data Feed allows downstream consumers to detect
+--   status changes (e.g. silver_status changing from PENDING to TRANSFORMED).
+--
+-- batch_control.pipeline_runs
+--   One row per Databricks notebook execution.
+--   Partitioned by layer (bronze/silver/gold/ml) for layer-specific queries.
+--   CDF enabled for monitoring dashboards.
+--
+-- batch_control.scd2_audit
+--   Records every Slowly Changing Dimension Type 2 change in gold.dim_facility.
+--   Stores old and new values as MAP<STRING,STRING> for flexibility.
+--   Not partitioned — SCD2 changes are infrequent.
+--
+-- batch_control.file_schedule
+--   Stores the expected ingestion schedule per hospital and file type.
+--   Columns include: facility_id, file_type, schedule_cron, grace_period_minutes,
+--   alert_severity, is_active, last_received_at, consecutive_misses.
+--   Seeded by 00_init_batch_control.py after table creation.
+--   Schema updated from original design via file_schedule_migration.py.
+--
+-- bronze.stg_staffing
+--   External Delta table — written by Databricks Auto Loader.
+--   LOCATION points to s3://hc-data-lake-prod/bronze/delta/stg_staffing.
+--   Creating the table here registers it in Unity Catalog; the actual Delta
+--   files are written by 01_bronze_ingestion.py using writeStream.
+--   All columns are STRING — type casting happens in Silver.
+--
+-- silver.staffing_standardized
+--   Partitioned by work_date for efficient date-range filtering in Gold.
+--   CDF enabled: Gold notebook reads Silver changes using CDF for incremental
+--   processing (avoids full Silver table scans on every Gold run).
+--   staffing_id (SHA256 of facility_id|work_date|role_code) is the MERGE key.
+--   _dq_flags ARRAY<STRING> records which DQ rules fired per record.
+--
+-- gold.dim_facility
+--   Implements SCD2 (Slowly Changing Dimension Type 2).
+--   is_current = true for the active row per facility_id.
+--   effective_from / effective_to track when each version was active.
+--   facility_key uses GENERATED ALWAYS AS IDENTITY for a surrogate key.
+--   When a hospital changes bed_capacity or staffing_benchmark, the old row
+--   gets effective_to set and is_current=false; a new row is inserted.
+--
+-- ml_ready.overtime_features
+--   Written by 04_ml_feature_pipeline.py using mode("overwrite") on every run.
+--   Not incremental — the full feature set is regenerated from Gold each time.
+--   7-day rolling window features require the full history to compute correctly.
+--
+-- =============================================================================
