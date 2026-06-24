@@ -33,7 +33,7 @@ A cloud-native healthcare staffing analytics platform that centralises operation
 ## Architecture Overview
 
 <p align="center">
-  <img src="images/HealthcareAnalyticsPlatform.png" width="700">
+  <img src="images/new_HealthcareAnalyticsPlatform.svg" width="700">
 </p>
 
 *Figure 1: End-to-end Healthcare Staffing Analytics Platform on AWS and Databricks.*
