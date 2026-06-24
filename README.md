@@ -1,755 +1,912 @@
-# Healthcare Staffing Analytics — v2
-## Databricks Lakehouse + Streamlit + Terraform
+# Healthcare Staffing Analytics Platform
 
-A cloud-native healthcare staffing analytics platform built on AWS and the Databricks Lakehouse. The platform centralizes operational staffing data from multi-facility hospital networks, supporting batch and real-time ingestion, automated data-quality governance, predictive workforce analytics, and executive reporting — all within a governed Medallion architecture on Delta Lake.
+**AWS · Databricks Lakehouse · Terraform · Streamlit**
+
+A cloud-native healthcare staffing analytics platform that centralises operational staffing data from multi-facility hospital networks. Supports batch and real-time ingestion, automated data-quality governance, predictive workforce analytics, and executive reporting — all within a governed Medallion architecture on Delta Lake.
 
 ---
 
-## Healthcare Solution Architect
+## Table of Contents
 
-<p align="center">
-  <img src="images/HealthcareAnalyticsPlatform.png" width="1000">
-</p>
-
-*Figure 1: End-to-end Healthcare Staffing Analytics Platform architecture on AWS and Databricks.*
-
+1. [Architecture Overview](#architecture-overview)
+2. [Data Flow](#data-flow)
+3. [Infrastructure — AWS Services](#infrastructure--aws-services)
+4. [Data Pipeline — Batch Path](#data-pipeline--batch-path)
+5. [Data Pipeline — Real-Time Path](#data-pipeline--real-time-path)
+6. [Lambda File Validator & DQ](#lambda-file-validator--dq)
+7. [Quarantine Process](#quarantine-process)
+8. [DynamoDB Operational Tables](#dynamodb-operational-tables)
+9. [AWS Glue — Schema Catalog](#aws-glue--schema-catalog)
+10. [Databricks Workflows](#databricks-workflows)
+11. [SNS Alerts & CloudWatch Monitoring](#sns-alerts--cloudwatch-monitoring)
+12. [Redis Caching Layer](#redis-caching-layer)
+13. [Streamlit Dashboard](#streamlit-dashboard)
+14. [Databricks Medallion Architecture](#databricks-medallion-architecture)
+15. [Unity Catalog Hierarchy](#unity-catalog-hierarchy)
+16. [Repository Structure](#repository-structure)
+17. [Quick Start — Running the Pipeline](#quick-start--running-the-pipeline)
+18. [Deployment](#deployment)
+19. [Why Databricks](#why-databricks)
 
 ---
 
 ## Architecture Overview
 
-
 <p align="center">
-  <img src="images/data_pipeline_architecture.png" width="90%">
+  <img src="images/HealthcareAnalyticsPlatform.png" width="700">
 </p>
 
+*Figure 1: End-to-end Healthcare Staffing Analytics Platform on AWS and Databricks.*
+
 <p align="center">
-  <em>Figure 1: End-to-end Healthcare Staffing Analytics Platform on AWS and Databricks.</em>
+  <img src="images/data_pipeline_architecture.png" width="100%">
 </p>
 
+*Figure 2: Batch & Real-Time pipeline flows converging at Gold Unified Analytics.*
 
+---
 
-## Operational Metadata Layer
+## Data Flow
 
-```text
-DynamoDB
-│
-├── hc_pipeline_log      → Pipeline execution history
-├── hc_file_ledger       → Processed file tracking
-├── hc_metadata_store    → Schema and configuration metadata
-├── hc_dq_log            → Data quality violations
-├── hc_job_checkpoint    → Incremental processing state
-└── hc_cache_manifest    → Cache and manifest tracking
+```
+Hospital Systems (SFTP / API / ADT)
+          │
+    ┌─────┴──────────────────────────┐
+    │ Batch Path                     │ Real-Time Path
+    ▼                                ▼
+S3 landing/sftp/              Kinesis rt-events-prod
+    │                                │
+    ▼                                ▼
+SQS file_arrival-prod         Lambda ESM (100 rec/batch)
+    │                                │
+    ▼                                ▼
+Lambda file_validator ←──────────────┘
+    │  DQ checks · checksum · HIPAA audit
+    ├── valid records ──► S3 bronze/sftp/
+    └── bad records  ──► SQS quarantine.fifo
+                          └► quarantine_index DynamoDB
+          │
+          ▼
+    SNS batch_complete
+          │
+    Lambda databricks-trigger
+          │
+    ┌─────┴──────────────────────────────────┐
+    │         Databricks ETL Job              │
+    │  Glue Crawler → Bronze → Silver → Gold → ML
+    └─────────────────────────────────────────┘
+          │
+    Serving Layer
+    Redis · Databricks SQL · Streamlit · Power BI
 ```
 
-## S3 Data Lake Architecture
+---
 
-Amazon S3 serves as the central storage layer for the healthcare analytics platform. All batch and real-time data is persisted in S3 before being processed by Databricks.
+## Infrastructure — AWS Services
 
-### S3 Bucket Structure
+| Service | Resource | Purpose |
+|---|---|---|
+| S3 | `hc-data-lake-prod` | Landing, Bronze, Silver, Gold, ML-ready, audit, quarantine, checkpoints |
+| SQS | `file_arrival-prod` (standard) | S3 → Lambda trigger for batch CSV files |
+| SQS | `quarantine-prod.fifo` (FIFO) | Bad records held for manual remediation |
+| SQS | `kinesis_dlq-prod` (standard) | Kinesis Lambda failure destination |
+| SQS | `file_arrival-dlq-prod` | Dead-letter queue for file_arrival processing failures |
+| Kinesis | `rt-events-prod` | 4 shards · 168-hour retention · real-time ADT events |
+| Lambda | `file-validator-prod` | DQ validation, Bronze write, DynamoDB writes, quarantine routing |
+| Lambda | `databricks-trigger-prod` | Calls Databricks Jobs API on SNS batch_complete |
+| Lambda | `redis-writer-prod` | Writes KPIs to ElastiCache after Gold run |
+| SNS | `batch_complete-prod` | Fires when S3 bronze/ file written — triggers ETL job |
+| SNS | `ops_alerts-prod` | Lambda errors, DQ failures, job failures → email alert |
+| Glue Crawler | `bronze-crawler-prod` | Schema discovery for bronze/sftp/ every 30 min during shifts |
+| Glue Catalog | `healthcare-data-platform_bronze_prod` | Metadata store for Auto Loader schema hints |
+| DynamoDB | 6 tables | Pipeline operational metadata (see [DynamoDB section](#dynamodb-operational-tables)) |
+| ElastiCache | Redis | Sub-second KPI serving for dashboards |
+| KMS | `e258d5b9-...` | Customer-managed encryption key for all services |
 
-```text
-s3://healthcare-data-platform/
+### S3 Bucket Layout
 
-├── landing/
-│   ├── sftp/
-│   ├── api/
-│   └── adt/
-│
-├── bronze/
-│
-├── silver/
-│
-├── gold/
-│
-├── ml-ready/
-│
-├── quarantine/
-│
-├── audit/
-│
-└── checkpoints/
+```
+s3://hc-data-lake-prod/
+├── landing/sftp/          # Raw files from hospital SFTP feeds
+├── bronze/sftp/           # Validated CSVs written by Lambda
+├── bronze/realtime/       # Valid Kinesis ADT records
+├── bronze/delta/          # Delta Lake tables (stg_staffing)
+├── silver/                # Transformed, DQ-flagged, deduplicated
+├── gold/                  # Business-ready fact and dim tables
+├── ml-ready/              # Feature-engineered datasets
+├── quarantine/            # Files that failed validation
+├── audit/ingestion/       # HIPAA audit trail (one JSON per file)
+├── checkpoints/           # Auto Loader and streaming checkpoints
+└── unity-catalog/         # Databricks Unity Catalog metadata (never wipe)
 ```
 
-### Intelligent Tiering
+### S3 Data Retention
 
-S3 Intelligent Tiering automatically optimizes storage costs by moving infrequently accessed data to lower-cost storage tiers while maintaining immediate retrieval capabilities.
+| Layer | Retention |
+|---|---|
+| Landing | 90 days |
+| Bronze | 1 year |
+| Silver | 3 years |
+| Gold | 7 years |
+| Audit | 7 years |
+| Quarantine | 180 days |
 
-### Encryption
+---
 
-All objects are encrypted using AWS KMS customer-managed keys.
+## Data Pipeline — Batch Path
 
-### Versioning
-
-Bucket versioning is enabled to support accidental deletion recovery, audit requirements, and regulatory compliance.
-
-### Lifecycle Management
-
-* Landing Data → 90 Days
-* Bronze Data → 1 Year
-* Silver Data → 3 Years
-* Gold Data → 7 Years
-* Audit Data → 7 Years
-* Quarantine Data → 180 Days
-
-
-
-## Event-Driven File Ingestion
-
-Amazon SQS decouples file arrival from downstream processing.
-
-### File Arrival Workflow
-
-```text
-Hospital Source
+```
+Hospital SFTP / API
         │
         ▼
-Landing S3
+S3 landing/sftp/<facility>/staff_<timestamp>.csv
+        │  S3 ObjectCreated notification
+        ▼
+SQS file_arrival-prod (standard)
+        │  Lambda event source mapping
+        ▼
+Lambda file-validator-prod
+  ├── Checksum check against ingestion_ledger (duplicate prevention)
+  ├── DQ rules: NULL_FACILITY_ID, CENSUS_OUT_OF_RANGE,
+  │             OT_HOURS_EXCEED_MAX, NEGATIVE_STAFF_COUNT
+  ├── Valid records → S3 bronze/sftp/
+  ├── Bad records  → SQS quarantine.fifo + quarantine_index DynamoDB
+  ├── Schema       → schema_registry DynamoDB (conditional write)
+  ├── DQ summary   → data_quality_results DynamoDB
+  ├── Ledger entry → ingestion_ledger DynamoDB
+  └── Audit record → S3 audit/ingestion/<date>/<checksum>.json
+        │
+        ▼ S3 ObjectCreated on bronze/sftp/
+SNS batch_complete-prod
         │
         ▼
-S3 Event Notification
+Lambda databricks-trigger-prod
+        │  Databricks Jobs API
+        ▼
+Healthcare ETL Pipeline (job 727296529764626)
+  Step 1: Run_Glue_Crawler
+  Step 2: Bronze_Ingestion_Workflow
+  Step 3: Silver_Transformation_Workflow
+  Step 4: Gold_Unified_Analytics
+  Step 5: ML_Feature_Pipeline
+```
+
+---
+
+## Data Pipeline — Real-Time Path
+
+```
+Hospital ADT Systems (ADMIT / DISCHARGE / TRANSFER)
         │
         ▼
-SQS File Arrival Queue
+Kinesis rt-events-prod (4 shards · 168-hr retention)
+        │  Lambda Event Source Mapping (batch 100 records)
+        ▼
+Lambda file-validator-prod
+  ├── Base64 decode Kinesis payload
+  ├── DQ checks (same rules as batch)
+  ├── Valid  → S3 bronze/realtime/<date>/<uuid>.json
+  ├── Bad    → SQS quarantine.fifo + quarantine_index DynamoDB
+  └── Audit  → S3 audit/realtime/<date>/<uuid>.json
         │
         ▼
-Glue Workflow Trigger
+Healthcare RT Streaming Pipeline (job 560379522229937)
+  Runs every 5 minutes — cron(0 0/5 * * * ?)
+  Step 1: ADT_Bronze_Streaming   → bronze.adt_events_raw
+  Step 2: ADT_Silver_Streaming   → silver.adt_events_standardized
         │
         ▼
-Databricks Auto Loader
+Gold_Unified_Analytics picks up silver.adt_events_standardized
+  → gold.fact_census_realtime (admits/discharges per unit per hour)
 ```
 
-### Benefits
+---
 
-* Fault tolerance
-* Decoupled processing
-* Retry capability
-* Horizontal scalability
-* Guaranteed event durability
+## Lambda File Validator & DQ
 
-### Quarantine Queue
+The `file-validator-prod` Lambda is the single entry point for all record-level validation. It handles both S3 (SQS-triggered) and Kinesis (ESM-triggered) event sources.
 
-Files that fail validation are routed to a dedicated quarantine queue for remediation and investigation.
+### DQ Rules
 
-## AWS Glue Metadata Layer
+| Rule | Trigger | Action |
+|---|---|---|
+| `NULL_FACILITY_ID` | `facility_id` is null or empty | Quarantine record |
+| `CENSUS_OUT_OF_RANGE` | `patient_census` < 0 or > 1500 | Quarantine record |
+| `OT_HOURS_EXCEED_MAX` | `hours_worked_overtime` > 24 | Quarantine record |
+| `NEGATIVE_STAFF_COUNT` | `staff_count` < 0 | Quarantine record |
+| `STAFF_COUNT_NOT_NUMERIC` | `staff_count` cannot be cast to int | Quarantine record |
 
-AWS Glue serves as the metadata and governance layer for the platform.
+### DynamoDB Writes (per file processed)
 
-### Glue Responsibilities
+| Table | What is written | When |
+|---|---|---|
+| `ingestion_ledger_prod` | File checksum, bronze path, record counts | Every file |
+| `quarantine_index_prod` | One row per bad record | DQ failure |
+| `data_quality_results_prod` | Pass rate, error summary, status | Every file |
+| `schema_registry_prod` | Column list + hash version | New schema only (conditional write) |
 
-* Schema discovery
-* Metadata catalog management
-* Data classification
-* Schema evolution tracking
-* Data lineage support
+### Bad Data Detection Flow
 
-### Glue Crawler Workflow
+<p align="center">
+  <img src="images/bad_data_detection_and_triage.svg" width="900">
+</p>
 
-```text
-Landing S3
-      │
-      ▼
-Glue Crawler
-      │
-      ▼
-Glue Catalog
-      │
-      ▼
-Databricks Reads Metadata
+---
+
+## Quarantine Process
+
+### How it works
+
+Bad records are quarantined at the record level — valid records in the same batch continue processing normally (partial batch support).
+
 ```
-## Real-Time Streaming Validation
-
-AWS Lambda performs lightweight validation for real-time healthcare events before data enters the Lakehouse.
-
-### Streaming Workflow
-
-```text
-ADT Events
-      │
-      ▼
-Kinesis Data Streams
-      │
-      ▼
-Lambda Validation
-      │
-      ▼
-Databricks Structured Streaming
-      │
-      ▼
-Bronze Delta Tables
+Bad record detected by Lambda
+        │
+        ├── SQS quarantine-prod.fifo
+        │     FIFO · 14-day retention · manual drain
+        │
+        └── quarantine_index_prod (DynamoDB)
+              source_file (HASH) + ingestion_timestamp (RANGE)
+              quarantine_reason · facility_id · raw_record · resolved flag
 ```
 
-### Validation Rules
+### Remediation workflow
 
-Lambda validates:
+<p align="center">
+  <img src="images/quarantine_remediation_loop.svg" width="900">
+</p>
 
-* Required fields
-* Message structure
-* Timestamp formats
-* Facility identifiers
-* Event type classifications
+**Step-by-step remediation:**
 
-### Failed Records
+```bash
+# 1. Review unresolved quarantine records
+python tests/dynamo_ops_queries.py --query quarantine_unresolved
 
-Invalid records are routed to:
+# 2. See which DQ rules are firing most
+python tests/dynamo_ops_queries.py --query quarantine_by_rule
 
-* Quarantine S3
-* SQS Quarantine Queue
-* SNS Alert Notifications
+# 3. Inspect all bad records from a specific file
+python tests/dynamo_ops_queries.py --query quarantine_by_file \
+  --file "s3://hc-data-lake-prod/landing/sftp/test_hospital/staff_20260623.csv"
 
-This prevents malformed data from entering analytical workloads.
+# 4. After fixing — re-upload to remediated/ prefix
+aws s3 cp fixed_record.csv \
+  s3://hc-data-lake-prod/landing/sftp/remediated/fixed_$(date +%s).csv
 
-### Benefits
-
-The Glue Catalog provides a centralized metadata repository that allows Databricks, Athena, and other AWS analytics services to share consistent schema definitions.
-
-
-## DynamoDB Operational Metadata Layer
-
-Amazon DynamoDB serves as the operational metadata and control-plane database for the healthcare analytics platform.
-
-While Databricks stores analytical data, DynamoDB stores pipeline operational state, checkpoints, lineage, and monitoring information.
-
-### DynamoDB Responsibilities
-
-* File ingestion tracking
-* Data quality logging
-* Job checkpoint management
-* Schema version tracking
-* Pipeline audit history
-* Cache registry management
-
-### DynamoDB Tables
-
-```text
-hc_pipeline_log
-hc_file_ledger
-hc_metadata_store
-hc_dq_log
-hc_job_checkpoint
-hc_cache_manifest
+# 5. S3 notification fires automatically → Lambda reprocesses
+# 6. Mark original quarantine record as resolved
+python tests/dynamo_ops_queries.py --query quarantine_by_file \
+  --file "s3://hc-data-lake-prod/landing/sftp/test_hospital/staff_20260623.csv"
 ```
 
-### Operational Workflow
+> The quarantine FIFO queue is separate from the `file_arrival-dlq`. The DLQ only captures Lambda processing failures on the S3 notification path — it does not receive intentionally quarantined records.
 
-```text
-Hospital File
-│
-▼
-S3 Landing
-│
-▼
-File Checksum
-│
-▼
-DynamoDB File Ledger
-│
-▼
-Duplicate Detection
-│
-▼
-Processing Approved
+---
+
+## DynamoDB Operational Tables
+
+<p align="center">
+  <img src="images/dynamodb_operational_tables.svg" width="900">
+</p>
+
+Six tables form the operational control plane — all written automatically by Lambda and Databricks notebooks.
+
+| Table | Key | Writer | Purpose |
+|---|---|---|---|
+| `ingestion_ledger_prod` | `file_checksum` (HASH) | Lambda | Duplicate prevention · Bronze path · record counts |
+| `quarantine_index_prod` | `source_file` (HASH) + `ingestion_timestamp` (RANGE) | Lambda | Per-record bad data audit · queryable without touching SQS |
+| `data_quality_results_prod` | `dataset_name` (HASH) + `run_timestamp` (RANGE) | Lambda | DQ pass rate trend · error breakdown per file |
+| `schema_registry_prod` | `dataset_name` (HASH) + `schema_version` (RANGE) | Lambda | Column schema versions · detects hospital format changes |
+| `job_bookmark_prod` | `job_name` (HASH) + `source_name` (RANGE) | Databricks notebooks | Last processed offset per job · enables incremental runs |
+| `pipeline_log_prod` | `pipeline_id` (HASH) + `event_timestamp` (RANGE) | Databricks notebooks | Job run history · duration · records processed |
+
+### Operational Queries
+
+```bash
+# Daily health check — covers all 6 tables
+python tests/dynamo_ops_queries.py --query all
+
+# Did all Databricks jobs run today?
+python tests/dynamo_ops_queries.py --query job_status
+
+# DQ trend for sftp_staffing over 7 days
+python tests/dynamo_ops_queries.py --query dq_trend --dataset sftp_staffing --days 7
+
+# Files that had quarantined records
+python tests/dynamo_ops_queries.py --query files_with_quarantine
+
+# Most common DQ failure rules
+python tests/dynamo_ops_queries.py --query quarantine_by_rule
+
+# Did this file already get processed? (duplicate check)
+python tests/dynamo_ops_queries.py --query duplicate_check --checksum <md5>
+
+# Schema drift — which hospitals changed their CSV columns?
+python tests/dynamo_ops_queries.py --query schema_drift
+
+# Pipeline failures in last 7 days
+python tests/dynamo_ops_queries.py --query pipeline_failures --days 7
 ```
 
-### Benefits
+---
 
-* Idempotent processing
-* Duplicate file prevention
-* Workflow checkpointing
-* Near real-time metadata access
-* Serverless scalability
-* Operational audit traceability
+## AWS Glue — Schema Catalog
+
+<p align="center">
+  <img src="images/glue_crawler_workflow.svg" width="900">
+</p>
+
+Glue's role in this platform is **schema catalog only** — it does not run ETL jobs or write to Delta tables.
+
+**What the Glue Crawler does:**
+- Scans `s3://hc-data-lake-prod/bronze/sftp/` every 30 minutes during shift hours (`cron(0/30 5-23 * * ? *)`)
+- Infers column types and partition keys
+- Registers table metadata in the `healthcare-data-platform_bronze_prod` Glue database
+- Fires an SNS `ops_alerts` notification when new columns are detected (schema drift)
+
+**What `glue_utils.get_glue_schema_hints()` does:**
+- Queries `information_schema.columns` in the Glue Catalog
+- Returns a comma-separated string of `column_name STRING` hints
+- Passed to Databricks Auto Loader as `cloudFiles.schemaHints`
+
+```bash
+# Start crawler manually (runs automatically on schedule)
+aws glue start-crawler \
+  --name healthcare-data-platform-bronze-crawler-prod \
+  --region us-east-1
+
+# Check crawler status
+aws glue get-crawler \
+  --name healthcare-data-platform-bronze-crawler-prod \
+  --region us-east-1 \
+  --query "Crawler.{State:State,LastStatus:LastCrawl.Status}"
+```
+
+---
+
+## Databricks Workflows
+
+<p align="center">
+  <img src="images/databricks_etl_and_streaming_workflows.svg" width="900">
+</p>
+
+Two separate Databricks jobs handle batch and real-time processing independently.
+
+### Job 1 — Healthcare ETL Pipeline (`727296529764626`)
+
+Triggered by `SNS batch_complete` → `Lambda databricks-trigger` after every successful S3 file validation. Also runs on a daily fallback cron at 6 AM UTC.
+
+| Step | Notebook | What it does |
+|---|---|---|
+| 1 | `00_run_glue_crawler` | Updates Glue Catalog schema before Auto Loader |
+| 2 | `01_bronze_ingestion` | Auto Loader reads bronze/sftp/ → Delta stg_staffing |
+| 3 | `02_silver_transformation` | Watermark filter · dedup · DQ flags · MERGE upsert |
+| 4 | `03_gold_unified_analytics` | fact_staffing · fact_overtime · dim_facility SCD2 |
+| 5 | `04_ml_feature_pipeline` | 7-day rolling windows · overtime features |
+
+```bash
+# Trigger manually
+databricks jobs run-now 727296529764626
+
+# Watch the run
+databricks runs list --job-id 727296529764626 --output json \
+  | python3 -m json.tool | grep -E "run_id|life_cycle|result_state" | head -10
+```
+
+### Job 2 — Healthcare RT Streaming Pipeline (`560379522229937`)
+
+Runs every 5 minutes on schedule (`cron(0 0/5 * * * ?)`). Processes Kinesis ADT events independently of the batch path.
+
+| Step | Notebook | What it does |
+|---|---|---|
+| 1 | `01_bronze_adt_streaming` | Kinesis → TRY_TO_BINARY decode → `bronze.adt_events_raw` |
+| 2 | `02_silver_adt_streaming` | Delta stream → census_delta → `silver.adt_events_standardized` |
+
+```bash
+# Trigger manually
+databricks jobs run-now 560379522229937
+```
+
+### Databricks Utility Notebooks
+
+All shared utilities live at `/Shared/healthcare/common/` and must be imported as NOTEBOOK type (not FILE):
+
+```bash
+# Import a utility as a notebook (no .py extension = NOTEBOOK type)
+databricks workspace import \
+  --language PYTHON --format SOURCE --overwrite \
+  dynamo_utils.py /Shared/healthcare/common/utils/dynamo_utils
+```
+
+| Notebook path | Purpose |
+|---|---|
+| `common/config/pipeline_config` | Central config — bucket names, table names, DQ rules, Kinesis config |
+| `common/utils/batch_control_utils` | `start_pipeline_run()` · `complete_pipeline_run()` |
+| `common/utils/dq_utils` | `build_dq_flags_column()` · `cast_silver_types()` · `get_watermark()` |
+| `common/utils/glue_utils` | `get_glue_schema_hints()` |
+| `common/utils/dynamo_utils` | `write_job_bookmark()` · `write_pipeline_log()` · `write_dq_results()` |
+
+Each pipeline notebook uses `%run` (not Python imports) to load these:
+
+```python
+# In each notebook — each %run must be in its own cell
+%run /Shared/healthcare/common/config/pipeline_config
+%run /Shared/healthcare/common/utils/dq_utils
+%run /Shared/healthcare/common/utils/batch_control_utils
+%run /Shared/healthcare/common/utils/dynamo_utils
+```
+
+---
+
+## SNS Alerts & CloudWatch Monitoring
+
+Two SNS topics with distinct purposes:
+
+| Topic | Fires when | Subscribers |
+|---|---|---|
+| `batch_complete-prod` | S3 `bronze/sftp/` file written | Lambda databricks-trigger · pipeline_log DynamoDB · Redis cache invalidation |
+| `ops_alerts-prod` | Lambda errors · DQ failures · Databricks job failures · schema drift | Email (`bshaunjay@gmail.com`) · data_quality_results DynamoDB · Streamlit status banner |
+
+### CloudWatch Alarm Thresholds
+
+| Alarm | Threshold | Severity |
+|---|---|---|
+| Lambda file_validator errors | > 0 in 5 min | CRITICAL |
+| SQS quarantine message age | > 30 min | WARN |
+| Kinesis IteratorAge | > 60 seconds | WARN |
+| DQ pass rate | < 90% | FAIL |
+| ETL job bookmark stale | Not run by 08:00 UTC | WARN |
+| `file_arrival` DLQ message count | > 0 | CRITICAL |
+
+```bash
+# Check if SNS batch_complete has the Lambda subscriber
+aws sns list-subscriptions-by-topic \
+  --topic-arn arn:aws:sns:us-east-1:657082399901:healthcare-data-platform-batch_complete-prod \
+  --region us-east-1
+
+# Check recent Lambda logs
+aws logs tail /aws/lambda/healthcare-data-platform-file-validator-prod \
+  --since 30m --region us-east-1
+```
+
+---
 
 ## Redis Caching Layer
 
-Amazon ElastiCache for Redis serves as the low-latency serving layer for dashboards, APIs, and operational metrics.
+ElastiCache Redis sits between Databricks Gold and the Streamlit dashboard. Databricks remains the system of record; Redis provides sub-second access to pre-computed KPIs.
 
-Databricks remains the system of record, while Redis provides sub-second access to frequently requested information.
+### Cache TTLs
 
-### Redis Responsibilities
+| Cache key | TTL | Invalidated by |
+|---|---|---|
+| `dim_facility` | 1 hour | SCD2 update in Gold |
+| `facility_daily_summary` | 15 minutes | `SNS batch_complete` → Lambda redis-writer |
+| `np_ratio_realtime` | 5 minutes | Kinesis batch write |
+| `ot_summary_monthly` | 30 minutes | ETL job complete |
+| `scorecard_quarterly` | 1 hour | ETL job complete |
+| `dq_dashboard` | 10 minutes | Any quarantine SQS event |
 
-* Dashboard caching
-* KPI acceleration
-* Dimension lookup caching
-* Real-time staffing metrics
-* Executive scorecard acceleration
+### Cache workflow
 
-### Redis Workflow
-
-```text
-Databricks Gold
+```
+Databricks Gold run completes
         │
         ▼
-Dashboard Query
+SNS batch_complete fires
         │
         ▼
-Redis Cache Check
+Lambda redis-writer-prod
+  writes pre-computed KPIs to Redis
         │
-   ┌────┴────┐
-   │         │
- Cache Hit   Cache Miss
-   │         │
-   ▼         ▼
-Return KPI  Databricks Query
-                 │
-                 ▼
-            Redis Refresh
+        ▼
+Streamlit dashboard
+  cache hit → sub-second response
+  cache miss → queries Databricks SQL Warehouse, refreshes cache
 ```
-
-### Cached Objects
-
-* Facility benchmark summaries
-* Daily staffing KPIs
-* Overtime scorecards
-* Workforce utilization metrics
-* Data quality dashboards
-
-### Benefits
-
-* Sub-second dashboard performance
-* Reduced Databricks SQL workload
-* Lower compute costs
-* Faster executive reporting
-* Improved user experience
-
 
 ---
 
-## Why Databricks over Snowflake and Redshift
+## Streamlit Dashboard
 
+The Streamlit dashboard connects to Databricks SQL Warehouse via the `databricks-sql-connector` and serves pre-computed KPIs from Redis.
 
-| Capability                           | Redshift                          | Snowflake                      | Databricks                             |
-| ------------------------------------ | --------------------------------- | ------------------------------ | -------------------------------------- |
-| Compute / Storage Separation         | ⚠️ RA3 nodes only                 | ✅ Fully separated              | ✅ Fully separated                      |
-| Batch Analytics                      | ✅                                 | ✅                              | ✅                                      |
-| Real-Time Streaming                  | ⚠️ Limited                        | ⚠️ Snowpipe Streaming          | ✅ Native Structured Streaming          |
-| Delta Lake Support                   | ❌                                 | ❌                              | ✅ Native                               |
-| ACID Data Lake Transactions          | ❌                                 | ❌                              | ✅ Delta Lake                           |
-| Time Travel                          | ❌ Manual snapshots                | ✅ Built-in                     | ✅ Delta Lake Time Travel               |
-| Schema Evolution                     | ⚠️ Manual management              | ✅ Easy management              | ✅ Automatic with Delta                 |
-| Machine Learning                     | ⚠️ SageMaker integration required | ⚠️ External ML tools           | ✅ Native MLflow Integration            |
-| AI / LLM Workloads                   | ⚠️ External services              | ⚠️ External services           | ✅ Native AI & GenAI Support            |
-| Feature Engineering                  | ❌                                 | ⚠️ Limited                     | ✅ Feature Store Support                |
-| Workforce Forecasting Models         | ⚠️ External platform              | ⚠️ External platform           | ✅ Native ML Platform                   |
-| Governance                           | ⚠️ IAM-centric                    | ✅ Strong RBAC                  | ✅ Unity Catalog                        |
-| Medallion Architecture               | ⚠️ Custom implementation          | ⚠️ Custom implementation       | ✅ Native Design Pattern                |
-| dbt Integration                      | ✅ Good                            | ✅ Excellent                    | ✅ Excellent                            |
-| Streamlit Integration                | ⚠️ JDBC/ODBC                      | ✅ Native Connector             | ✅ SQL Warehouse Connector              |
-| Auto Scaling Compute                 | ⚠️ Limited                        | ✅ Virtual Warehouses           | ✅ Cluster & Serverless Scaling         |
-| Cost Efficiency (Large Data Volumes) | ⚠️ Good                           | ✅ Very Good                    | ✅ Excellent                            |
-| Best Use Case                        | Traditional Data Warehouse        | Enterprise Analytics Warehouse | Data Engineering + Streaming + ML + AI |
-
-
-For this healthcare staffing analytics platform, Databricks was selected as the primary analytical platform because the business requirements extend beyond traditional reporting and dashboarding. The platform must support near real-time staffing visibility, predictive overtime analysis, workforce forecasting, staffing shortage detection, and AI-driven staffing recommendations. Databricks provides a unified Lakehouse architecture combining data engineering, streaming, machine learning, AI, and analytics within a single platform, making it better aligned with the organization's long-term growth strategy than a traditional warehouse-centric architecture.
-
----
-
-
-
-
-## Repository Structure
-
-```text
-healthcare_v2/
-├── terraform/
-│   ├── main.tf
-│   ├── variables.tf
-│   ├── providers.tf
-│   ├── terraform.tfvars
-│   ├── modules/
-│   │   ├── databricks/            # Workspace, Unity Catalog, SQL Warehouses
-│   │   ├── iam/                   # Glue, Lambda, Databricks access roles
-│   │   ├── kinesis/               # Real-time streaming infrastructure
-│   │   ├── sqs/                   # File arrival and quarantine queues
-│   │   ├── sns/                   # Alerts and notifications
-│   │   ├── dynamodb/              # Metadata, lineage, checkpoints, DQ logs
-│   │   ├── elasticache/           # Redis caching layer
-│   │   ├── glue/                  # Crawlers, Catalog, workflows
-│   │   ├── s3/                    # Landing, Bronze, Silver, Gold, ML-ready
-│   │   ├── kms/                   # Encryption keys
-│   │   └── networking/            # VPC, Subnets, Security Groups, NAT
-│   │
-│   └── environments/
-│       ├── dev/
-│       │   └── terraform.tfvars
-│       └── prod/
-│           └── terraform.tfvars
-│
-├── databricks/
-│   ├── notebooks/
-│   │
-│   │   ├── bronze/
-│   │   │   ├── bronze_sftp_ingestion.py
-│   │   │   ├── bronze_api_ingestion.py
-│   │   │   └── bronze_streaming_ingestion.py
-│   │   │
-│   │   ├── silver/
-│   │   │   ├── silver_staffing_transform.py
-│   │   │   ├── silver_patient_census.py
-│   │   │   └── silver_data_quality.py
-│   │   │
-│   │   ├── gold/
-│   │   │   ├── gold_staffing_kpis.py
-│   │   │   ├── gold_facility_benchmark.py
-│   │   │   ├── gold_overtime_metrics.py
-│   │   │   └── gold_executive_summary.py
-│   │   │
-│   │   └── ml_ready/
-│   │       ├── overtime_forecast_features.py
-│   │       ├── staffing_shortage_features.py
-│   │       └── workforce_planning_features.py
-│   │
-│   ├── workflows/
-│   │   ├── bronze_to_silver.yml
-│   │   ├── silver_to_gold.yml
-│   │   ├── ml_feature_pipeline.yml
-│   │   └── realtime_streaming.yml
-│   │
-│   ├── sql/
-│   │   ├── executive_dashboard.sql
-│   │   ├── staffing_benchmark.sql
-│   │   ├── overtime_analysis.sql
-│   │   └── workforce_planning.sql
-│   │
-│   ├── dashboards/
-│   │   ├── executive_dashboard.json
-│   │   ├── operations_dashboard.json
-│   │   └── data_quality_dashboard.json
-│   │
-│   └── unity_catalog/
-│       ├── catalogs.sql
-│       ├── schemas.sql
-│       └── grants.sql
-│
-├── monitoring/
-│   ├── cloudwatch/
-│   │   ├── alarms.tf
-│   │   └── dashboards.tf
-│   │
-│   ├── alerts/
-│   │   ├── sns_notifications.py
-│   │   ├── slack_notifications.py
-│   │   └── email_notifications.py
-│   │
-│   └── data_quality/
-│       ├── dq_rules.yml
-│       ├── dq_monitoring.py
-│       └── dq_scorecards.py
-│
-├── streamlit/
-│   ├── app.py
-│   ├── requirements.txt
-│   │
-│   ├── pages/
-│   │   ├── executive_summary.py
-│   │   ├── facility_benchmarking.py
-│   │   ├── overtime_analysis.py
-│   │   ├── staffing_shortage_detection.py
-│   │   ├── workforce_planning.py
-│   │   └── data_quality_dashboard.py
-│   │
-│   └── .streamlit/
-│       └── secrets.toml.example
-│
-├── docs/
-│   ├── architecture/
-│   │   ├── solution_architecture.md
-│   │   ├── data_flow.md
-│   │   └── disaster_recovery.md
-│   │
-│   ├── operations/
-│   │   ├── deployment_runbook.md
-│   │   ├── monitoring_runbook.md
-│   │   └── incident_response.md
-│   │
-│   └── business_requirements/
-│       ├── staffing_analytics_requirements.md
-│       └── executive_kpis.md
-│
-└── README.md
-```
-
-
----
-
-## Deployment Runbook
-
-### 1. Prerequisites
-
-```bash
-# Install tooling
-brew install terraform awscli databricks
-
-# Python packages
-pip install databricks-sdk
-pip install databricks-sql-connector
-pip install streamlit
-pip install mlflow
-
-# Configure AWS credentials
-aws configure --profile healthcare-prod
-
-# Configure Databricks CLI
-databricks configure --host https://<workspace-url>
-
-# Verify connectivity
-databricks current-user me
-```
-
-### 2. Terraform — Infrastructure
-
-```bash
-cd terraform/
-
-# Initialize Terraform
-terraform init \
-  -backend-config="bucket=healthcare-tfstate-prod" \
-  -backend-config="dynamodb_table=healthcare-tflock"
-
-# Review deployment plan
-terraform plan -var-file="environments/prod/terraform.tfvars"
-
-# Deploy infrastructure
-terraform apply -var-file="environments/prod/terraform.tfvars"
-
-# Verify deployed resources
-aws s3 ls
-aws glue get-databases
-aws dynamodb list-tables
-aws elasticache describe-replication-groups
-```
-
-### 3. Databricks — Initial Workspace Setup
-
-```bash
-# Import notebooks
-databricks workspace import-dir \
-  databricks/notebooks \
-  /Shared/healthcare
-
-# Deploy workflows
-databricks bundle deploy
-
-# Validate cluster connectivity
-databricks clusters list
-
-# Validate Unity Catalog
-databricks catalogs list
-```
-
-### 4. Databricks — Initial Data Processing
-
-```bash
-# Run Bronze ingestion
-Bronze_Ingestion_Workflow
-
-# Run Silver transformation
-Silver_Transformation_Workflow
-
-# Run Gold KPI generation
-Gold_Analytics_Workflow
-
-# Run ML feature generation
-ML_Feature_Pipeline
-```
-
-### 5. Databricks — Daily Incremental Processing
-
-```bash
-Bronze Auto Loader
-        ↓
-Silver Incremental Merge
-        ↓
-Gold KPI Refresh
-        ↓
-ML Feature Refresh
-        ↓
-Dashboard Cache Refresh
-```
-
-Databricks Workflows orchestrate all incremental processing using Delta Lake transaction logs, ensuring only new or modified data is processed.
-
-
-
-## Databricks Medallion Architecture
-
-```text
-Landing (S3)
-    │
-    ▼
-Bronze Delta Tables
-    │
-    ▼
-Silver Delta Tables
-    │
-    ▼
-Gold Delta Tables
-    │
-    ├── Executive KPIs
-    ├── Facility Benchmarking
-    ├── Overtime Analytics
-    ├── Staffing Utilization
-    └── Workforce Planning
-    │
-    ▼
-ML-Ready Feature Layer
-```
-
-### Bronze Layer
-
-Stores raw healthcare operational data exactly as received from:
-
-* SFTP feeds
-* Hospital APIs
-* ADT events
-* Scheduling systems
-
-### Silver Layer
-
-Applies:
-
-* Data quality validation
-* Deduplication
-* Schema standardization
-* Timestamp normalization
-* Facility mapping
-* Workforce enrichment
-
-### Gold Layer
-
-Contains business-ready datasets:
-
-* Staffing KPIs
-* Facility performance metrics
-* Overtime metrics
-* Workforce utilization
-* Executive reporting datasets
-
-### ML-Ready Layer
-
-Provides feature-engineered datasets for:
-
-* Predictive overtime forecasting
-* Staffing shortage detection
-* Workforce planning optimization
-* AI-driven staffing recommendations
-
-## Databricks Unity Catalog Hierarchy
-
-```text
-healthcare_catalog
-│
-├── bronze
-│   ├── staffing_raw
-│   ├── patient_census_raw
-│   └── adt_events_raw
-│
-├── silver
-│   ├── staffing_standardized
-│   ├── patient_census
-│   ├── workforce_reference
-│   └── data_quality_results
-│
-├── gold
-│   ├── fact_staffing
-│   ├── fact_overtime
-│   ├── fact_facility_performance
-│   ├── dim_facility
-│   ├── dim_date
-│   └── executive_summary
-│
-└── ml_ready
-    ├── overtime_features
-    ├── staffing_shortage_features
-    └── workforce_planning_features
-```
-
-Unity Catalog Governance
-
-```text
-Healthcare_Admin
-    Full platform administration
-
-Healthcare_Data_Engineer
-    Read/Write Bronze, Silver, Gold
-
-Healthcare_Data_Analyst
-    Read Gold and ML-Ready
-
-Healthcare_Executive
-    Dashboard-only access
-
-Healthcare_Auditor
-    Read-only compliance access
-```
-
-### 6. Streamlit — Local Development
+### Run locally
 
 ```bash
 cd streamlit/
+
 pip install -r requirements.txt
 
-# Copy and fill in credentials
-cp .streamlit/secrets.toml.example .streamlit/secrets.toml
+# Set credentials
+export DATABRICKS_HOST=https://dbc-f7e66250-5dc3.cloud.databricks.com
+export DATABRICKS_TOKEN=dapi...
+export DATABRICKS_HTTP_PATH=/sql/1.0/warehouses/<warehouse-id>
 
 streamlit run app.py
 ```
 
-### 7. Streamlit — Production (ECS Fargate recommended)
+### Deploy to ECS Fargate
 
 ```bash
-# Build Docker image
+# Build image
 docker build -t healthcare-dashboard:latest .
 
 # Push to ECR
-aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_URL
+aws ecr get-login-password --region us-east-1 \
+  | docker login --username AWS --password-stdin $ECR_URL
 docker push $ECR_URL/healthcare-dashboard:latest
 
-# Deploy to ECS (Terraform manages the ECS task + ALB)
+# Deploy via Terraform
 terraform apply -target=module.ecs
 ```
 
 ---
 
+## Databricks Medallion Architecture
 
+```
+Landing (S3 landing/sftp/)
+    │  Lambda validates + writes
+    ▼
+Bronze Delta  (healthcare_catalog.bronze.stg_staffing)
+    │  Auto Loader — availableNow · schemaHints · checkpoint
+    ▼
+Silver Delta  (healthcare_catalog.silver.staffing_standardized)
+    │  Watermark · dedup · DQ flags · MERGE upsert · SCD2
+    ▼
+Gold Delta    (healthcare_catalog.gold.*)
+    │  fact_staffing · fact_overtime · dim_facility · fact_census_realtime
+    ▼
+ML-Ready Delta (healthcare_catalog.ml_ready.overtime_features)
+    │  7-day rolling windows · lag features · will_overtime_next_day
+    ▼
+Serving Layer
+    Redis · Databricks SQL · Streamlit · Power BI · AI Staffing Models
+```
 
-## DynamoDB Tables (6)
+### Layer responsibilities
 
-| Table | Purpose | TTL |
-|---|---|---|
-| `hc_pipeline_log` | Every Glue/Lambda run — status, duration, record counts | 90 days |
-| `hc_file_ledger` | File checksum idempotency | 365 days |
-| `hc_metadata_store` | Schema versions, feature flags, DQ config | No TTL |
-| `hc_dq_log` | Per-record DQ violations, queryable by facility/rule | 30 days |
-| `hc_job_checkpoint` | Watermarks for incremental loads | No TTL |
-| `hc_cache_manifest` | Registry of what's in Redis — aids cold-start recovery | Matches Redis TTL |
+**Bronze** — raw data exactly as received. All STRING types. Auto Loader adds `_source_file`, `_ingested_at`, `_record_index` metadata columns.
+
+**Silver** — clean, typed, deduplicated. Applies `cast_silver_types()` (date normalisation across 6 hospital date formats), builds `staffing_id` SHA256 surrogate key, adds `_dq_flags` array. MERGE upsert on `staffing_id`.
+
+**Gold** — business-ready. `fact_staffing` and `fact_overtime` keyed on `(date_key, facility_id, role_code)`. `dim_facility` as SCD2. `fact_census_realtime` from ADT Silver stream. Dedup window applied before every MERGE to prevent `DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW`.
+
+**ML-Ready** — feature-engineered overwrite. 7-day rolling averages for census, staff count, and OT%. `will_overtime_next_day` lead feature. Delta overwrite with `overwriteSchema=true`.
 
 ---
 
-## Redis Cache TTLs
+## Unity Catalog Hierarchy
 
-| Group | TTL | Invalidated by |
-|---|---|---|
-| `dim_facility` (key maps for Lambda) | 1 hr | DIM_FACILITY SCD2 update |
-| `dim_nursing_role` | 24 hr | Seed reload |
-| `facility_daily_summary` | 15 min | databricks run complete → SNS → warmer |
-| `np_ratio_realtime` | 5 min | Kinesis batch write |
-| `ot_summary_monthly` | 30 min | databricks run complete |
-| `scorecard_quarterly` | 1 hr | databricks run complete |
-| `dq_dashboard` | 10 min | Any quarantine SQS event |
+```
+healthcare_catalog
+│
+├── bronze
+│   ├── stg_staffing         # Raw CSV records from hospital SFTP
+│   └── adt_events_raw       # Raw Kinesis ADT events
+│
+├── silver
+│   ├── staffing_standardized   # Typed, deduped, DQ-flagged
+│   └── adt_events_standardized # Normalised ADT with census_delta
+│
+├── gold
+│   ├── fact_staffing           # Daily staffing grain
+│   ├── fact_overtime           # OT records with cost estimate
+│   ├── fact_census_realtime    # Hourly census from ADT stream
+│   └── dim_facility            # SCD2 facility dimension
+│
+├── ml_ready
+│   └── overtime_features       # 7-day rolling feature set
+│
+└── batch_control
+    ├── file_schedule           # Expected ingestion schedule per facility
+    ├── file_registry           # File lineage tracking
+    ├── pipeline_runs           # ETL run history
+    └── scd2_audit              # SCD2 change tracking
+```
 
+### Unity Catalog access roles
 
-| Service    | Responsibility         |
-| ---------- | ---------------------- |
-| S3         | Data Lake Storage      |
-| SQS        | Event-driven ingestion |
-| Glue       | Metadata & Catalog     |
-| Kinesis    | Real-time ingestion    |
-| Lambda     | Validation             |
-| Databricks | Processing & Analytics |
-| DynamoDB   | Operational metadata   |
-| Redis      | Low-latency serving    |
-| Streamlit  | Presentation           |
-| SNS        | Alerting               |
-| CloudWatch | Monitoring             |
-# Healthcare_Analytics_Platform
+| Role | Access |
+|---|---|
+| `Healthcare_Admin` | Full platform administration |
+| `Healthcare_Data_Engineer` | Read/Write Bronze, Silver, Gold |
+| `Healthcare_Data_Analyst` | Read Gold and ML-Ready |
+| `Healthcare_Executive` | Dashboard-only (Gold views) |
+| `Healthcare_Auditor` | Read-only compliance access |
+
+---
+
+## Repository Structure
+
+```
+healthcare_v2/
+├── module_terraform/           # All Terraform IaC
+│   ├── main.tf
+│   ├── variables.tf
+│   ├── terraform.tfvars
+│   ├── providers.tf
+│   ├── versions.tf
+│   └── modules/
+│       ├── databricks/         # Workspace, Unity Catalog, jobs
+│       ├── iam/                # Lambda, Glue, Databricks roles
+│       ├── kinesis/            # Real-time stream + Lambda ESM
+│       ├── sqs/                # file_arrival, quarantine, kinesis_dlq
+│       ├── sns/                # batch_complete, ops_alerts
+│       ├── dynamodb/           # All 6 operational tables
+│       ├── elasticache/        # Redis cluster
+│       ├── glue/               # Crawler + Catalog
+│       ├── s3/                 # Data lake bucket + notifications
+│       ├── kms/                # Customer-managed key
+│       ├── lambda_file_validator/
+│       ├── lambda_trigger/
+│       └── network/            # VPC, subnets, NAT
+│
+├── databricks/
+│   ├── common/
+│   │   ├── config/
+│   │   │   └── pipeline_config.py
+│   │   └── utils/
+│   │       ├── batch_control_utils.py
+│   │       ├── dq_utils.py
+│   │       ├── glue_utils.py
+│   │       └── dynamo_utils.py
+│   └── pipelines/
+│       ├── bronze/
+│       │   ├── 00_run_glue_crawler.py
+│       │   ├── 01_bronze_ingestion.py
+│       │   └── 01_bronze_adt_streaming.py
+│       ├── silver/
+│       │   ├── 02_silver_transformation.py
+│       │   └── 02_silver_adt_streaming.py
+│       ├── gold/
+│       │   └── 03_gold_unified_analytics.py
+│       ├── ml/
+│       │   └── 04_ml_feature_pipeline.py
+│       └── batch_control/
+│           └── 00_init_batch_control.py
+│
+├── jobs/
+│   ├── healthcare_etl_job_serverless.json
+│   └── healthcare_rt_streaming_job_serverless.json
+│
+├── lambda_src/
+│   └── file_validator/
+│       └── app.py
+│
+├── streamlit/
+│   └── app.py
+│
+├── tests/
+│   ├── fixtures/
+│   │   └── factory.py
+│   ├── send_test_data.py
+│   ├── dynamo_ops_queries.py
+│   └── test_healthcare_pipeline.py
+│
+├── scripts/
+│   ├── cleanup_pipeline.py
+│   ├── load_databricks_secrets.sh
+│   └── phase1_aws_services_only.sh
+│
+├── docs/
+│   ├── TERRAFORM_DEPLOY_RUNBOOK.md
+│   ├── AWS_PIPELINE_VERIFICATION.md
+│   └── OPERATIONS_GUIDE.md
+│
+└── images/
+    ├── HealthcareAnalyticsPlatform.png
+    ├── data_pipeline_architecture.png
+    ├── bad_data_detection_and_triage.svg
+    ├── quarantine_remediation_loop.svg
+    ├── dynamodb_operational_tables.svg
+    ├── glue_crawler_workflow.svg
+    └── databricks_etl_and_streaming_workflows.svg
+```
+
+---
+
+## Quick Start — Running the Pipeline
+
+### Prerequisites
+
+```bash
+# Python environment
+python3.13 -m venv hc_staff
+source hc_staff/bin/activate
+pip install boto3 faker pandas databricks-sql-connector pyarrow pytest
+
+# AWS CLI
+brew install awscli
+aws configure --profile de_jay_east
+
+# Databricks CLI
+brew install databricks
+databricks configure --host https://dbc-f7e66250-5dc3.cloud.databricks.com
+
+# Terraform
+brew install terraform
+```
+
+### Environment setup
+
+```bash
+# AWS
+export AWS_PROFILE=de_jay_east
+export AWS_DEFAULT_REGION=us-east-1
+
+# Databricks credentials from AWS Secrets Manager
+source module_terraform/scripts/load_databricks_secrets.sh
+
+# Databricks SQL Warehouse (for file_schedule seeding)
+export DATABRICKS_HOST=https://dbc-f7e66250-5dc3.cloud.databricks.com
+export DATABRICKS_TOKEN=dapi...
+export DATABRICKS_HTTP_PATH=/sql/1.0/warehouses/<warehouse-id>
+```
+
+### Step 1 — Clean slate (optional, for fresh test)
+
+```bash
+# Dry run first — see exactly what will be deleted
+python scripts/cleanup_pipeline.py --dry-run
+
+# Full cleanup — wipes DynamoDB, SQS queues, S3, Databricks Delta tables
+python scripts/cleanup_pipeline.py --yes
+```
+
+### Step 2 — Seed test data
+
+```bash
+# Dry run — verify all 6 paths look correct
+python tests/send_test_data.py --dry-run
+
+# Live run — sends data through all paths
+python tests/send_test_data.py
+
+# Send bad records to test the quarantine flow
+python tests/send_test_data.py --paths s3 --include-bad
+
+# Send specific paths only
+python tests/send_test_data.py --paths s3 kinesis dynamodb file_schedule
+```
+
+**What each path does:**
+
+| Path | What is sent |
+|---|---|
+| `s3` | CSV file to `landing/sftp/test_hospital/` → triggers Lambda |
+| `kinesis` | 10 ADT events (ADMIT/DISCHARGE/TRANSFER) to Kinesis stream |
+| `dynamodb` | Seeds all 6 DynamoDB operational tables with test data |
+| `file_schedule` | Upserts STAFFING/SCHEDULE_DELTA/CALLOUT rows to `batch_control.file_schedule` |
+
+### Step 3 — Run the ETL pipeline
+
+```bash
+# Trigger the batch ETL job (Glue → Bronze → Silver → Gold → ML)
+databricks jobs run-now 727296529764626
+
+# Trigger the RT streaming job (Kinesis ADT → Bronze → Silver)
+databricks jobs run-now 560379522229937
+
+# Watch ETL job progress
+open https://dbc-f7e66250-5dc3.cloud.databricks.com/#job/727296529764626/runs
+```
+
+### Step 4 — Verify data landed correctly
+
+```bash
+# Check Lambda processed the S3 file
+aws logs tail /aws/lambda/healthcare-data-platform-file-validator-prod \
+  --since 10m --region us-east-1
+
+# Check DynamoDB tables
+python tests/dynamo_ops_queries.py --query all
+
+# Check S3 Bronze zone
+aws s3 ls s3://hc-data-lake-prod/bronze/sftp/ --recursive | head -10
+
+# Check Kinesis stream is active
+aws kinesis describe-stream-summary \
+  --stream-name healthcare-data-platform-rt-events-prod \
+  --region us-east-1 \
+  --query "StreamDescriptionSummary.{Status:StreamStatus,Shards:OpenShardCount}"
+```
+
+```sql
+-- In Databricks — verify Gold tables populated
+SELECT COUNT(*), MIN(date_key), MAX(date_key)
+FROM healthcare_catalog.gold.fact_staffing;
+
+SELECT facility_id, work_date, nurse_patient_ratio, overtime_pct
+FROM healthcare_catalog.gold.fact_staffing
+ORDER BY date_key DESC LIMIT 20;
+
+SELECT * FROM healthcare_catalog.batch_control.file_schedule
+ORDER BY facility_id, file_type;
+```
+
+### Step 5 — Run the Streamlit dashboard
+
+```bash
+cd streamlit/
+streamlit run app.py
+```
+
+---
+
+## Deployment
+
+Full deployment instructions, known issues, and redeploy procedures are in [`docs/TERRAFORM_DEPLOY_RUNBOOK.md`](docs/TERRAFORM_DEPLOY_RUNBOOK.md).
+
+### Deploy order summary
+
+```bash
+# Phase 1 — Foundation
+terraform apply -target=module.kms
+terraform apply -target=module.network
+terraform apply -target=module.iam
+
+# Phase 2 — Re-apply KMS with Databricks principal
+terraform apply -target=module.kms
+
+# Phase 3 — AWS services
+terraform apply \
+  -target=module.s3_data_lake \
+  -target=module.dynamodb \
+  -target=module.kinesis \
+  -target=module.sqs \
+  -target=module.sns \
+  -target=module.elasticache \
+  -target=module.glue
+
+# Phase 4 — Lambda
+terraform apply \
+  -target=module.lambda_file_validator \
+  -target=module.lambda_redis_writer
+
+# Phase 5 — Databricks (two-pass for Unity Catalog storage credentials)
+terraform apply -target=module.databricks
+# Get unity_catalog_iam_arn from state → update tfvars → re-apply IAM + KMS
+terraform apply -target=module.iam
+terraform apply -target=module.kms
+terraform apply -target=module.databricks
+
+# Phase 6 — Final
+terraform apply
+```
+
+---
+
+## Why Databricks
+
+| Capability | Redshift | Snowflake | Databricks |
+|---|---|---|---|
+| Real-time streaming | ⚠️ Limited | ⚠️ Snowpipe only | ✅ Native Structured Streaming |
+| Delta Lake / ACID | ❌ | ❌ | ✅ Native |
+| Time travel | ❌ Manual | ✅ Built-in | ✅ Delta Lake |
+| Machine learning | ⚠️ SageMaker | ⚠️ External | ✅ Native MLflow |
+| Medallion architecture | ⚠️ Custom | ⚠️ Custom | ✅ Native pattern |
+| Unity Catalog governance | ⚠️ IAM-centric | ✅ RBAC | ✅ Unity Catalog |
+| Streamlit integration | ⚠️ JDBC | ✅ Connector | ✅ SQL Warehouse connector |
+| Feature engineering | ❌ | ⚠️ Limited | ✅ Feature Store |
+
+Databricks was selected because this platform must support near real-time staffing visibility, predictive overtime analysis, workforce forecasting, and AI-driven staffing recommendations in a single unified platform — requirements that extend beyond what a warehouse-centric architecture can deliver without significant external tooling.
+
+---
+
+## Service Responsibilities Summary
+
+| Service | Role |
+|---|---|
+| S3 | Data lake storage — all layers |
+| SQS | Event-driven file ingestion · quarantine · DLQ |
+| Kinesis | Real-time ADT event streaming (4 shards) |
+| Lambda | File validation · DQ · Bronze writes · DynamoDB writes · quarantine routing |
+| SNS | Pipeline completion events · operational alerts |
+| Glue | Schema catalog only — no ETL |
+| DynamoDB | 6 operational tables — pipeline metadata and control plane |
+| ElastiCache Redis | Sub-second KPI serving for dashboards |
+| Databricks | ETL · streaming · Gold analytics · ML feature engineering |
+| Streamlit | Live operational dashboard |
+| CloudWatch | Metrics · alarms · log aggregation |
+| KMS | Customer-managed encryption for all services |
