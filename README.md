@@ -40,7 +40,7 @@ A cloud-native healthcare staffing analytics platform that centralises operation
 *Figure 1: End-to-end Healthcare Staffing Analytics Platform on AWS and Databricks.*
 
 <p align="center">
-  <img src="images/data_pipeline_architecture.png" width="100%">
+  <img src="images/medallion_architecture_full.svg" width="100%">
 </p>
 
 *Figure 2: Batch & Real-Time pipeline flows converging at Gold Unified Analytics.*
@@ -136,6 +136,10 @@ s3://hc-data-lake-prod/
 ---
 
 ## Network Architecture — VPC & Security
+
+<p align="center">
+  <img src="images/vpc_network_architecture.svg" width="700">
+</p>
 
 The platform runs inside a dedicated VPC with strict network isolation. All compute resources (Lambda, Glue, Redis) are in private subnets — no direct internet access. HIPAA requires this boundary to ensure PHI never traverses the public internet.
 
